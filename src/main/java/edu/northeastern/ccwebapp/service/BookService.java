@@ -2,7 +2,11 @@ package edu.northeastern.ccwebapp.service;
 
 import edu.northeastern.ccwebapp.Util.ResponseMessage;
 import edu.northeastern.ccwebapp.pojo.Book;
+import edu.northeastern.ccwebapp.pojo.RedisBook;
 import edu.northeastern.ccwebapp.repository.BookRepository;
+import edu.northeastern.ccwebapp.repository.RedisBookRepository;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Timer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.http.HttpStatus;
@@ -11,15 +15,21 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class BookService {
 
     private BookRepository bookRepository;
+    private RedisBookRepository redisBookRepository;
+
+    private static final Timer dbTimer = Metrics.timer("database_timer");
+    private static final Timer redisTimer = Metrics.timer("redis_timer");
     private final static Logger logger = LogManager.getLogger(BookService.class);
 
-    public BookService(BookRepository bookRepository) {
+    public BookService(BookRepository bookRepository, RedisBookRepository redisBookRepository) {
         this.bookRepository = bookRepository;
+        this.redisBookRepository = redisBookRepository;
 
     }
 
@@ -45,7 +55,9 @@ public class BookService {
 
     public ResponseEntity<?> getBooks() {
         List<Book> bookDetails;
+
         bookDetails = bookRepository.findAll();
+
         return new ResponseEntity<>(bookDetails, HttpStatus.OK);
     }
 
@@ -74,7 +86,10 @@ public class BookService {
             currentBook.setAuthor(book.getAuthor());
             currentBook.setIsbn(book.getIsbn());
             currentBook.setQuantity(book.getQuantity());
-            save(currentBook);
+
+            redisBookRepository.deleteById(currentBook.getId());
+
+            this.save(currentBook);
             return new ResponseEntity<>(HttpStatus.NO_CONTENT);
         } else {
             responseMessage.setMessage("Book with id " + book.getId() + " not found");
@@ -84,11 +99,43 @@ public class BookService {
     }
 
     public Book getBookById(String id) {
-        return bookRepository.findById(id);
+        long start = System.nanoTime();
+        RedisBook redisBook = redisBookRepository.findById(id).orElse(null);
+        redisTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+
+        if(redisBook != null) {
+            Book book = new Book();
+            book.setId(redisBook.getId());
+            book.setAuthor(redisBook.getAuthor());
+            book.setIsbn(redisBook.getIsbn());
+            book.setQuantity(redisBook.getQuantity());
+            book.setTitle(redisBook.getTitle());
+            logger.warn("Get book from redis!");
+            return book;
+        } else {
+            logger.warn("Get book from database!");
+            start = System.nanoTime();
+            Book book = bookRepository.findById(id);
+            dbTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+            return book;
+        }
     }
 
     public void save(Book book) {
+        long start = System.nanoTime();
         bookRepository.save(book);
+        dbTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+
+        RedisBook redisBook = new RedisBook();
+        redisBook.setId(book.getId());
+        redisBook.setAuthor(book.getAuthor());
+        redisBook.setIsbn(book.getIsbn());
+        redisBook.setQuantity(book.getQuantity());
+        redisBook.setTitle(book.getTitle());
+
+        start = System.nanoTime();
+        redisBookRepository.save(redisBook);
+        redisTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
     }
 
     public ResponseEntity<?> deleteBook(String id) {
@@ -105,7 +152,15 @@ public class BookService {
     }
 
     private void deleteBookById(String id) {
+
+        long start = System.nanoTime();
+        RedisBook redisBook = redisBookRepository.findById(id).orElse(null);
+        if(redisBook != null) redisBookRepository.deleteById(redisBook.getId());
+        redisTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+
+        start = System.nanoTime();
         bookRepository.deleteById(id);
+        dbTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
     }
 
 }
